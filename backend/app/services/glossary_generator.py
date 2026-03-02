@@ -48,10 +48,28 @@ def _get_client():
         )
         return _client, model
 
-    # --- Azure OpenAI (managed identity) ---
+    # --- Azure OpenAI (API key preferred, managed identity fallback) ---
     if settings.azure_openai_endpoint:
         try:
             from openai import AzureOpenAI
+
+            if settings.azure_openai_key:
+                # API key auth – works everywhere (local, Docker, cloud)
+                _client = AzureOpenAI(
+                    azure_endpoint=settings.azure_openai_endpoint,
+                    api_key=settings.azure_openai_key,
+                    api_version=settings.azure_openai_api_version,
+                )
+                _client_kind = "azure"
+                logger.info(
+                    "Glossary generator: using Azure OpenAI at %s "
+                    "(deployment=%s, auth=api-key)",
+                    settings.azure_openai_endpoint,
+                    settings.azure_openai_deployment,
+                )
+                return _client, settings.azure_openai_deployment
+
+            # Managed identity fallback
             from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
             credential = DefaultAzureCredential()
@@ -65,7 +83,8 @@ def _get_client():
             )
             _client_kind = "azure"
             logger.info(
-                "Glossary generator: using Azure OpenAI at %s (deployment=%s)",
+                "Glossary generator: using Azure OpenAI at %s "
+                "(deployment=%s, auth=managed-identity)",
                 settings.azure_openai_endpoint,
                 settings.azure_openai_deployment,
             )
@@ -179,7 +198,6 @@ def generate_glossary(
         )
         response = client.chat.completions.create(
             model=model,
-            temperature=0.2,
             max_tokens=4096,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},

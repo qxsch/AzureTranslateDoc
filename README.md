@@ -114,13 +114,13 @@ az cognitiveservices account create \
     --custom-domain translatedoc-dev-openai \
     --yes
 
-# Deploy the gpt-4o model
+# Deploy the gpt-5.2 model
 az cognitiveservices account deployment create \
     --name translatedoc-dev-openai \
     --resource-group rg-translatedoc-dev \
-    --deployment-name gpt-4o \
-    --model-name gpt-4o \
-    --model-version 2024-11-20 \
+    --deployment-name gpt-5.2-chat \
+    --model-name gpt-5.2-chat \
+    --model-version 2026-02-10 \
     --model-format OpenAI \
     --sku-name GlobalStandard \
     --sku-capacity 30
@@ -167,7 +167,7 @@ AZURE_STORAGE_CONNECTION_STRING=<paste-connection-string>
 
 # ── Azure OpenAI (optional – for Enhanced Accuracy) ──
 AZURE_OPENAI_ENDPOINT=https://translatedoc-dev-openai.openai.azure.com
-AZURE_OPENAI_DEPLOYMENT=gpt-4o
+AZURE_OPENAI_DEPLOYMENT=gpt-5.2-chat
 # Or use an OpenAI API key instead:
 # OPENAI_API_KEY=sk-...
 ```
@@ -331,10 +331,10 @@ Translates a document.
 | `AZURE_STORAGE_ACCOUNT_NAME` | *(empty)* | Storage account for batch translation |
 | `AZURE_STORAGE_CONNECTION_STRING` | *(empty)* | Storage connection string (local dev with key auth) |
 | `AZURE_OPENAI_ENDPOINT` | *(empty)* | Azure OpenAI endpoint for glossary generation |
-| `AZURE_OPENAI_DEPLOYMENT` | `gpt-4o` | Azure OpenAI model deployment name |
+| `AZURE_OPENAI_DEPLOYMENT` | `gpt-5.2-chat` | Azure OpenAI model deployment name |
 | `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | Azure OpenAI API version |
 | `OPENAI_API_KEY` | *(empty)* | OpenAI API key (local dev fallback for glossary generation) |
-| `OPENAI_MODEL` | `gpt-4o` | OpenAI model name (when using API key) |
+| `OPENAI_MODEL` | `gpt-5.2-chat` | OpenAI model name (when using API key) |
 
 ---
 

@@ -26,6 +26,7 @@ from ..services.job_manager import (
     get_job,
     process_job,
 )
+from ..services.text_translator import translate_text
 from ..services.translator import (
     CONTENT_TYPES,
     SUPPORTED_FORMATS,
@@ -75,6 +76,55 @@ async def get_formats():
             "contentTypes": [ct],
         })
     return {"formats": fallback}
+
+
+# ---------------------------------------------------------------------------
+# Text translation endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post("/translate-text")
+async def translate_text_endpoint(
+    text: str = Form(...),
+    source_language: str = Form("auto"),
+    target_language: str = Form("en"),
+    mode: str = Form("azure"),
+):
+    """Translate plain text using the specified mode.
+
+    Modes:
+      - ``azure``   – Azure Translator Text API (fast)
+      - ``llm``     – LLM-only translation
+      - ``premium`` – Two-pass: Azure + LLM refinement
+    """
+    if source_language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported source language: {source_language}",
+        )
+    if target_language not in SUPPORTED_LANGUAGES or target_language == "auto":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported target language: {target_language}",
+        )
+    if mode not in ("azure", "llm", "premium"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported mode: {mode}. Use 'azure', 'llm', or 'premium'.",
+        )
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    if len(text) > 50_000:
+        raise HTTPException(
+            status_code=413,
+            detail="Text too long. Maximum 50,000 characters.",
+        )
+
+    try:
+        result = await translate_text(text, source_language, target_language, mode)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------

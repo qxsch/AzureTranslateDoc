@@ -28,7 +28,7 @@
 #>
 param(
     [string]$ResourceGroup  = "rg-translatedoc",
-    [string]$Location       = "switzerlandnorth",
+    [string]$Location       = "swedencentral",
     [string]$AppName        = "translatedoc",
     [switch]$localDockerBuild,
     [string]$CustomDomain   = "",

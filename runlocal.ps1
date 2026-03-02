@@ -94,15 +94,14 @@ if (-not (Test-Path $envFilePath)) {
                       Select-Object -First 1
 
     $openaiEndpoint = ""
-    $openaiDeployment = "gpt-4o"
+    $openaiDeployment = "gpt-5.2-chat"
     $openaiApiKey = ""
     if ($openaiResource) {
         $openaiEndpoint = "https://$($openaiResource.AccountName).openai.azure.com"
-        $openaiKey = (Get-AzCognitiveServicesAccountKey -ResourceGroupName $ResourceGroup -Name $openaiResource.AccountName).Key1
-        $openaiApiKey = ""  # We use key-based auth via AZURE_OPENAI_ENDPOINT + key header
+        $openaiApiKey = (Get-AzCognitiveServicesAccountKey -ResourceGroupName $ResourceGroup -Name $openaiResource.AccountName).Key1
         Write-Host "  Azure OpenAI: $openaiEndpoint (deployment=$openaiDeployment)" -ForegroundColor Gray
         Write-Host ""
-        Write-Host "  NOTE: For local Docker, Azure OpenAI uses key-based auth." -ForegroundColor Yellow
+        Write-Host "  NOTE: For local Docker, Azure OpenAI uses API key auth." -ForegroundColor Yellow
         Write-Host "  Alternatively, set OPENAI_API_KEY in .env for direct OpenAI API access." -ForegroundColor Yellow
     } else {
         Write-Host "  No Azure OpenAI resource found in '$ResourceGroup'." -ForegroundColor Yellow
@@ -122,6 +121,7 @@ if (-not (Test-Path $envFilePath)) {
     )
     if ($openaiResource) {
         $envLines += "AZURE_OPENAI_ENDPOINT=$openaiEndpoint"
+        $envLines += "AZURE_OPENAI_KEY=$openaiApiKey"
         $envLines += "AZURE_OPENAI_DEPLOYMENT=$openaiDeployment"
         # For local Docker, we pass the key directly since managed identity is not available
         $envLines += "# Azure OpenAI key for local auth (managed identity not available in Docker)"
@@ -130,7 +130,7 @@ if (-not (Test-Path $envFilePath)) {
     } else {
         $envLines += "# No Azure OpenAI found. For enhanced translation, set one of:"
         $envLines += "# AZURE_OPENAI_ENDPOINT=https://<name>.openai.azure.com"
-        $envLines += "# AZURE_OPENAI_DEPLOYMENT=gpt-4o"
+        $envLines += "# AZURE_OPENAI_DEPLOYMENT=gpt-5.2-chat"
         $envLines += "# --- OR ---"
         $envLines += "# OPENAI_API_KEY=sk-..."
     }

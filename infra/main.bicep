@@ -125,7 +125,7 @@ resource openai 'Microsoft.CognitiveServices/accounts@2025-10-01-preview' = {
 
 resource openaiDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-10-01-preview' = {
   parent: openai
-  name: 'gpt-4o'
+  name: 'gpt-5.2-chat'
   sku: {
     name: 'GlobalStandard'
     capacity: 30
@@ -133,8 +133,8 @@ resource openaiDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025
   properties: {
     model: {
       format: 'OpenAI'
-      name: 'gpt-4o'
-      version: '2024-11-20'
+      name: 'gpt-5.2-chat'
+      version: '2026-02-10'
     }
   }
 }
@@ -342,13 +342,14 @@ resource containerApp 'Microsoft.App/containerApps@2025-07-01' = {
             { name: 'AZURE_CLIENT_ID', value: managedIdentity.properties.clientId }
             { name: 'AZURE_STORAGE_ACCOUNT_NAME', value: storageAccount.name }
             { name: 'AZURE_OPENAI_ENDPOINT', value: 'https://${openaiName}.openai.azure.com' }
-            { name: 'AZURE_OPENAI_DEPLOYMENT', value: 'gpt-4o' }
+            { name: 'AZURE_OPENAI_DEPLOYMENT', value: 'gpt-5.2-chat' }
           ]
         }
       ]
       scale: {
         minReplicas: 0
-        maxReplicas: 2
+        maxReplicas: 1
+        cooldownPeriod: 1800
         rules: [
           {
             name: 'http-rule'
