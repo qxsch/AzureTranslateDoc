@@ -1,6 +1,6 @@
 # TranslateDoc
 
-A clean, joyful document translation web app powered by **Azure AI Translator**. Upload a document (Word, PDF, TXT, Markdown), pick your languages, and download the translated version — all in a single click.
+A document translation web app powered by **Azure AI Translator**. Upload a document (Word, PDF, TXT, Markdown), pick your languages, and download the translated version — all in a single click.
 
 ![Architecture](https://img.shields.io/badge/Azure-Container%20App-blue) ![Python](https://img.shields.io/badge/Backend-FastAPI%20%7C%20Python-green) ![React](https://img.shields.io/badge/Frontend-React%20%7C%20Vite-purple)
 
@@ -80,28 +80,71 @@ The script will:
 
 ## Local Development
 
-### 1. Create an Azure Translator resource
+### 1. Create Azure resources
 
-You need an Azure AI Translator resource for the translation API, even when running locally.
+You need an Azure AI Translator resource (required) and optionally Azure OpenAI + a Storage Account for enhanced accuracy mode.
 
 ```bash
 # Create a resource group (or use an existing one)
 az group create --name rg-translatedoc-dev --location eastus
 
-# Create the Translator resource
+# ── Azure AI Translator (required) ──────────────────────────────
 az cognitiveservices account create \
     --name translatedoc-dev \
     --resource-group rg-translatedoc-dev \
     --kind TextTranslation \
     --sku S1 \
     --location eastus \
+    --custom-domain translatedoc-dev \
     --yes
 
-# Get the key
+# Get the Translator key
 az cognitiveservices account keys list \
     --name translatedoc-dev \
     --resource-group rg-translatedoc-dev \
     --query key1 -o tsv
+
+# ── Azure OpenAI (optional – needed for Enhanced Accuracy) ─────
+az cognitiveservices account create \
+    --name translatedoc-dev-openai \
+    --resource-group rg-translatedoc-dev \
+    --kind OpenAI \
+    --sku S0 \
+    --location eastus \
+    --custom-domain translatedoc-dev-openai \
+    --yes
+
+# Deploy the gpt-4o model
+az cognitiveservices account deployment create \
+    --name translatedoc-dev-openai \
+    --resource-group rg-translatedoc-dev \
+    --deployment-name gpt-4o \
+    --model-name gpt-4o \
+    --model-version 2024-11-20 \
+    --model-format OpenAI \
+    --sku-name GlobalStandard \
+    --sku-capacity 30
+
+# Get the OpenAI key
+az cognitiveservices account keys list \
+    --name translatedoc-dev-openai \
+    --resource-group rg-translatedoc-dev \
+    --query key1 -o tsv
+
+# ── Storage Account (optional – needed for binary file translation e.g. PDF/DOCX) ──
+az storage account create \
+    --name sttranslatedev \
+    --resource-group rg-translatedoc-dev \
+    --location eastus \
+    --sku Standard_LRS \
+    --kind StorageV2 \
+    --allow-blob-public-access false
+
+# Get the storage connection string
+az storage account show-connection-string \
+    --name sttranslatedev \
+    --resource-group rg-translatedoc-dev \
+    --query connectionString -o tsv
 ```
 
 ### 2. Configure environment variables
@@ -113,10 +156,20 @@ cp .env.example .env
 Edit `.env`:
 
 ```ini
-AZURE_TRANSLATOR_ENDPOINT=https://api.cognitive.microsofttranslator.com
-AZURE_TRANSLATOR_KEY=<paste-your-key-here>
+# ── Translator (required) ──────────────────────
+AZURE_TRANSLATOR_ENDPOINT=https://translatedoc-dev.cognitiveservices.azure.com
+AZURE_TRANSLATOR_KEY=<paste-translator-key>
 AZURE_TRANSLATOR_REGION=eastus
 USE_MANAGED_IDENTITY=false
+
+# ── Storage (optional – for PDF/DOCX batch translation) ──
+AZURE_STORAGE_CONNECTION_STRING=<paste-connection-string>
+
+# ── Azure OpenAI (optional – for Enhanced Accuracy) ──
+AZURE_OPENAI_ENDPOINT=https://translatedoc-dev-openai.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+# Or use an OpenAI API key instead:
+# OPENAI_API_KEY=sk-...
 ```
 
 ### 3a. Run with Docker Compose (easiest)
