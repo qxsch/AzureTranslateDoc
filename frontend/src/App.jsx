@@ -27,6 +27,7 @@ export default function App() {
   const [files, setFiles] = useState([]);
   const [sourceLang, setSourceLang] = useState("auto");
   const [targetLang, setTargetLang] = useState("en");
+  const [enhanceAccuracy, setEnhanceAccuracy] = useState(false);
 
   // idle | uploading | processing | done | error
   const [phase, setPhase] = useState("idle");
@@ -170,6 +171,7 @@ export default function App() {
     files.forEach((f) => form.append("files", f));
     form.append("source_language", sourceLang);
     form.append("target_language", targetLang);
+    if (enhanceAccuracy) form.append("enhance_accuracy", "true");
 
     try {
       const res = await fetch("/api/translate", { method: "POST", body: form });
@@ -241,7 +243,22 @@ export default function App() {
   const statusIcon = (s) =>
     s === "completed" ? "✅" :
     s === "error" ? "❌" :
-    s === "translating" ? "⏳" : "⏸️";
+    s === "translating" ? "⏳" :
+    s === "enhancing" ? "🔬" : "⏸️";
+
+  const statusLabel = (f) => {
+    if (f.status === "completed") return "Done";
+    if (f.status === "error") return f.error?.slice(0, 80) || "Failed";
+    if (f.status === "translating") return "Translating…";
+    if (f.status === "enhancing") {
+      if (f.substatus === "pass1") return "Pass 1 — translating…";
+      if (f.substatus === "extracting") return "Extracting text…";
+      if (f.substatus === "glossary") return "Generating glossary…";
+      if (f.substatus === "pass2") return "Pass 2 — re-translating…";
+      return "Enhancing…";
+    }
+    return "Pending";
+  };
 
   /* ---- Render ---- */
   return (
@@ -355,6 +372,26 @@ export default function App() {
           <div className="warning animate-shake">⚠️ {fileWarning}</div>
         )}
 
+        {/* Enhance accuracy toggle */}
+        <label className="enhance-toggle">
+          <input
+            type="checkbox"
+            checked={enhanceAccuracy}
+            onChange={(e) => setEnhanceAccuracy(e.target.checked)}
+            disabled={isProcessing || phase === "done"}
+          />
+          <span className="enhance-toggle__content">
+            <span className="enhance-toggle__label">
+              🔬 Enhance accuracy
+              <span className="enhance-toggle__badge">Premium</span>
+            </span>
+            <span className="enhance-toggle__hint">
+              Two-pass translation with AI glossary — slower but more accurate for
+              domain-specific documents
+            </span>
+          </span>
+        </label>
+
         {/* Translate button */}
         <button
           className={`btn-translate ${isProcessing ? "btn-translate--loading" : ""}`}
@@ -373,7 +410,7 @@ export default function App() {
           ) : phase === "done" ? (
             <>✅ Complete</>
           ) : (
-            <>🚀 Translate{files.length > 1 ? ` ${files.length} files` : ""}</>
+            <>🚀 {enhanceAccuracy ? "Enhanced " : ""}Translate{files.length > 1 ? ` ${files.length} files` : ""}</>
           )}
         </button>
 
@@ -392,13 +429,7 @@ export default function App() {
                 <span className="result-row__icon">{statusIcon(f.status)}</span>
                 <span className="result-row__name">{f.output_name}</span>
                 <span className="result-row__status">
-                  {f.status === "completed"
-                    ? "Done"
-                    : f.status === "error"
-                      ? (f.error?.slice(0, 80) || "Failed")
-                      : f.status === "translating"
-                        ? "Translating…"
-                        : "Pending"}
+                  {statusLabel(f)}
                 </span>
                 {f.status === "completed" && (
                   <button

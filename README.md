@@ -12,6 +12,7 @@ A clean, joyful document translation web app powered by **Azure AI Translator**.
 |---|---|
 | **Supported formats** | `.pdf`, `.docx`, `.txt`, `.md` |
 | **Languages** | English, German, French, Spanish, Italian, Chinese (Simplified), Japanese + auto-detect |
+| **Enhanced accuracy** | Optional two-pass translation with AI-generated glossary (Premium) |
 | **Auth** | Entra ID (Azure AD) — every user in your tenant |
 | **Identity** | Managed Identity in Azure; API key fallback for local dev |
 | **Infra-as-Code** | Bicep template for all Azure resources |
@@ -26,11 +27,11 @@ A clean, joyful document translation web app powered by **Azure AI Translator**.
 │   Browser    │───▶│  Container App    │───▶│  Azure AI Translator│
 │  (React SPA) │◀───│  (FastAPI/Python) │◀───│  (Cognitive Svc)    │
 └──────────────┘     └──────────────────┘     └─────────────────────┘
-                            │
-                     ┌──────┴──────┐
-                     │  Entra ID   │
-                     │  (EasyAuth) │
-                     └─────────────┘
+                            │                          │
+                     ┌──────┴──────┐            ┌──────┴───────┐
+                     │  Entra ID   │            │ Azure OpenAI │
+                     │  (EasyAuth) │            │ (glossary AI)│
+                     └─────────────┘            └──────────────┘
 ```
 
 **Resources created by the Bicep template:**
@@ -38,10 +39,12 @@ A clean, joyful document translation web app powered by **Azure AI Translator**.
 | Resource | Purpose |
 |---|---|
 | Azure AI Translator | Text translation API |
+| Azure OpenAI | LLM for glossary generation (enhanced accuracy) |
 | Azure Container Registry | Hosts the Docker image |
 | Container App Environment | Serverless compute |
 | Container App | Runs the application |
-| User-Assigned Managed Identity | Passwordless access to Translator & ACR |
+| User-Assigned Managed Identity | Passwordless access to Translator, OpenAI & ACR |
+| Storage Account | Blob storage for batch document translation |
 | Log Analytics + App Insights | Monitoring |
 
 ---
@@ -191,6 +194,9 @@ translatedoc/
 │   │   │   └── translate.py        # /api/translate, /api/languages, /api/health
 │   │   └── services/
 │   │       ├── translator.py       # Azure Translator client + batching
+│   │       ├── job_manager.py      # Job orchestration + enhanced pipeline
+│   │       ├── glossary_generator.py  # LLM-powered glossary generation
+│   │       └── text_extractor.py   # Text extraction from PDF/DOCX/XLSX/PPTX
 │   ├── tests/                      # Unit & integration tests
 │   ├── requirements.txt
 │   └── pytest.ini
@@ -204,7 +210,7 @@ translatedoc/
 │   ├── package.json
 │   └── vite.config.js              # Proxy config for dev
 ├── infra/
-│   └── main.bicep                  # All Azure resources
+│   └── main.bicep                  # All Azure resources (incl. OpenAI)
 ├── Dockerfile                      # Multi-stage (Node build + Python runtime)
 ├── docker-compose.yml              # Local testing
 ├── deploy.ps1                      # Windows deployment script
@@ -242,9 +248,10 @@ Translates a document.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `file` | File (multipart) | Yes | — | The document to translate |
+| `files` | File(s) (multipart) | Yes | — | One or more documents to translate |
 | `source_language` | string | No | `auto` | Source language code |
 | `target_language` | string | No | `en` | Target language code |
+| `enhance_accuracy` | boolean | No | `false` | Enable two-pass translation with AI glossary (Premium — slower) |
 
 **Response:** The translated document as a binary download with the original filename.
 
@@ -268,6 +275,50 @@ Translates a document.
 | `USE_MANAGED_IDENTITY` | `false` | Set `true` in Azure to use Managed Identity |
 | `AZURE_CLIENT_ID` | *(empty)* | User-assigned Managed Identity client ID (set automatically by Bicep) |
 | `MAX_FILE_SIZE_MB` | `10` | Maximum upload size in MB |
+| `AZURE_STORAGE_ACCOUNT_NAME` | *(empty)* | Storage account for batch translation |
+| `AZURE_STORAGE_CONNECTION_STRING` | *(empty)* | Storage connection string (local dev with key auth) |
+| `AZURE_OPENAI_ENDPOINT` | *(empty)* | Azure OpenAI endpoint for glossary generation |
+| `AZURE_OPENAI_DEPLOYMENT` | `gpt-4o` | Azure OpenAI model deployment name |
+| `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | Azure OpenAI API version |
+| `OPENAI_API_KEY` | *(empty)* | OpenAI API key (local dev fallback for glossary generation) |
+| `OPENAI_MODEL` | `gpt-4o` | OpenAI model name (when using API key) |
+
+---
+
+## Enhanced Accuracy Mode (Premium)
+
+When the **"Enhance accuracy"** checkbox is enabled, each file goes through a three-stage pipeline:
+
+1. **Pass 1** — Standard translation via Azure AI Translator
+2. **Glossary generation** — An LLM (Azure OpenAI or OpenAI) compares the source document with the Pass 1 result, identifies domain-specific terms, proper nouns, and inconsistencies, and generates a TSV glossary
+3. **Pass 2** — Re-translation with the glossary attached, enforcing consistent terminology
+
+### How it works
+
+- Text is extracted from both the original and translated documents (supports PDF, DOCX, XLSX, PPTX, TXT, Markdown)
+- The LLM receives both texts and produces a tab-separated glossary of up to 200 terms
+- Azure Translator's built-in glossary support is used for the second pass (exact-match enforcement)
+- If any enhancement step fails, the Pass 1 result is returned as a fallback
+
+### When to use it
+
+- Documents with domain-specific terminology (legal, medical, technical)
+- Documents with proper nouns, brand names, or abbreviations
+- When consistency across repeated terms is important
+
+### Cost & speed implications
+
+- **Slower**: Each file requires two translation passes + one LLM call
+- **Additional cost**: Azure OpenAI tokens are consumed for glossary generation
+- The UI clearly labels this as "Premium" with a description of the trade-off
+
+### Authentication
+
+| Environment | Authentication |
+|---|---|
+| **Azure (production)** | Managed Identity → Cognitive Services OpenAI User role (configured by Bicep) |
+| **Local (runlocal.ps1)** | Azure OpenAI key auto-discovered from Azure, OR set `OPENAI_API_KEY` in `.env` |
+| **Local (manual)** | Set `AZURE_OPENAI_ENDPOINT` + key, or `OPENAI_API_KEY` in `.env` |
 
 ---
 

@@ -88,6 +88,7 @@ async def translate_endpoint(
     files: List[UploadFile] = File(...),
     source_language: str = Form("auto"),
     target_language: str = Form("en"),
+    enhance_accuracy: bool = Form(False),
 ):
     """Accept one or more files and start an async translation job.
 
@@ -136,7 +137,7 @@ async def translate_endpoint(
         file_data.append((f.filename, ext, content))
 
     # --- create job & schedule background processing ---
-    job = create_job(file_data, source_language, target_language)
+    job = create_job(file_data, source_language, target_language, enhance_accuracy)
     background_tasks.add_task(process_job, job)
 
     return {"job_id": job.id}
@@ -155,12 +156,14 @@ async def get_job_status(job_id: str):
         "source_language": job.source_lang,
         "target_language": job.target_lang,
         "target_language_name": job.target_lang_name,
+        "enhance_accuracy": job.enhance_accuracy,
         "files": [
             {
                 "index": f.index,
                 "original_name": f.original_name,
                 "output_name": f.output_name,
                 "status": f.status,
+                "substatus": f.substatus,
                 "error": f.error,
             }
             for f in job.files

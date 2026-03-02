@@ -14,6 +14,15 @@ class Settings(BaseSettings):
     azure_storage_account_name: str = ""
     azure_storage_connection_string: str = ""
 
+    # Azure OpenAI – used for glossary-enhanced translation (managed identity)
+    azure_openai_endpoint: str = ""
+    azure_openai_deployment: str = "gpt-4o"
+    azure_openai_api_version: str = "2024-12-01-preview"
+
+    # OpenAI API – fallback for local development (key-based)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 

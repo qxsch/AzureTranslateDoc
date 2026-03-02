@@ -2,6 +2,12 @@
 
 Manages async translation jobs: each job can contain one or more files.
 Jobs are stored in memory and auto-purged after ``_JOB_TTL`` seconds.
+
+When ``enhance_accuracy`` is enabled, each file goes through a three-stage
+pipeline:
+  1. Pass 1 – standard translation
+  2. Text extraction + LLM glossary generation
+  3. Pass 2 – re-translation with the glossary attached
 """
 
 import asyncio
@@ -10,6 +16,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from .glossary_generator import generate_glossary, is_available as llm_available
+from .text_extractor import extract_text
 from .translator import SUPPORTED_LANGUAGES, translate_document
 
 logger = logging.getLogger(__name__)
@@ -35,8 +43,9 @@ class FileResult:
     original_name: str
     output_name: str
     file_extension: str
-    status: str = "pending"         # pending | translating | completed | error
+    status: str = "pending"         # pending | translating | enhancing | completed | error
     error: str | None = None
+    substatus: str = ""             # pass1 | extracting | glossary | pass2 (for enhanced)
 
     # Stored in memory; cleared when the job is purged.
     _input_bytes: bytes = field(default=b"", repr=False)
@@ -52,6 +61,7 @@ class TranslationJob:
     source_lang: str
     target_lang: str
     target_lang_name: str
+    enhance_accuracy: bool = False
     files: list[FileResult] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
@@ -108,6 +118,7 @@ def create_job(
     files: list[tuple[str, str, bytes]],   # (filename, extension, content)
     source_lang: str,
     target_lang: str,
+    enhance_accuracy: bool = False,
 ) -> TranslationJob:
     """Create a new translation job (not yet started)."""
     _purge_expired()
@@ -131,6 +142,7 @@ def create_job(
         source_lang=source_lang,
         target_lang=target_lang,
         target_lang_name=lang_name,
+        enhance_accuracy=enhance_accuracy,
         files=file_results,
     )
     _jobs[job_id] = job
@@ -181,14 +193,136 @@ async def _translate_file(
         logger.error("Translation failed for %s: %s", file.original_name, exc)
 
 
+async def _translate_file_enhanced(
+    file: FileResult,
+    source_lang: str,
+    target_lang: str,
+) -> None:
+    """Three-stage enhanced translation for a single file.
+
+    1. Translate normally (pass 1)
+    2. Extract text from source + pass-1 result → LLM glossary
+    3. Re-translate with the glossary (pass 2)
+
+    Falls back to the pass-1 result if any enhancement step fails.
+    """
+    file.status = "enhancing"
+    original_bytes = file._input_bytes
+    pass1_result = None
+
+    try:
+        # ── Pass 1: standard translation ──
+        file.substatus = "pass1"
+        logger.info("Enhanced [%s] pass 1: translating…", file.original_name)
+        pass1_result = await translate_document(
+            file_bytes=original_bytes,
+            filename=file.original_name,
+            file_extension=file.file_extension,
+            source_lang=source_lang,
+            target_lang=target_lang,
+        )
+
+        # ── Extract text ──
+        file.substatus = "extracting"
+        logger.info("Enhanced [%s]: extracting text…", file.original_name)
+        source_text = extract_text(original_bytes, file.file_extension)
+        translated_text = extract_text(pass1_result, file.file_extension)
+
+        if not source_text.strip():
+            logger.warning(
+                "Enhanced [%s]: could not extract source text, "
+                "returning pass-1 result.", file.original_name,
+            )
+            file._result_bytes = pass1_result
+            file.status = "completed"
+            file.substatus = ""
+            file._input_bytes = b""
+            return
+
+        # ── LLM glossary generation ──
+        file.substatus = "glossary"
+        logger.info("Enhanced [%s]: generating glossary…", file.original_name)
+
+        source_lang_name = SUPPORTED_LANGUAGES.get(source_lang, source_lang)
+        target_lang_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
+        glossary_bytes = generate_glossary(
+            source_text=source_text,
+            translated_text=translated_text,
+            source_lang=source_lang_name,
+            target_lang=target_lang_name,
+        )
+
+        if not glossary_bytes:
+            logger.warning(
+                "Enhanced [%s]: glossary generation returned empty, "
+                "returning pass-1 result.", file.original_name,
+            )
+            file._result_bytes = pass1_result
+            file.status = "completed"
+            file.substatus = ""
+            file._input_bytes = b""
+            return
+
+        # ── Pass 2: re-translate with glossary ──
+        file.substatus = "pass2"
+        logger.info(
+            "Enhanced [%s] pass 2: re-translating with glossary "
+            "(%d bytes)…", file.original_name, len(glossary_bytes),
+        )
+        pass2_result = await translate_document(
+            file_bytes=original_bytes,
+            filename=file.original_name,
+            file_extension=file.file_extension,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            glossary_bytes=glossary_bytes,
+        )
+
+        file._result_bytes = pass2_result
+        file.status = "completed"
+        file.substatus = ""
+        file._input_bytes = b""
+        logger.info("Enhanced [%s]: done.", file.original_name)
+
+    except Exception as exc:
+        logger.error(
+            "Enhanced translation failed for %s at substatus '%s': %s",
+            file.original_name, file.substatus, exc,
+        )
+        # If we have a pass-1 result, return that as fallback
+        if pass1_result is not None:
+            logger.info(
+                "Using pass-1 fallback for %s.", file.original_name,
+            )
+            file._result_bytes = pass1_result
+            file.status = "completed"
+            file.error = f"Enhanced mode partially failed ({file.substatus}); standard translation returned."
+        else:
+            file.status = "error"
+            file.error = str(exc)
+        file.substatus = ""
+        file._input_bytes = b""
+
+
 async def process_job(job: TranslationJob) -> None:
     """Process all files in a job concurrently."""
     job.status = "processing"
 
-    tasks = [
-        _translate_file(f, job.source_lang, job.target_lang)
-        for f in job.files
-    ]
+    if job.enhance_accuracy and llm_available():
+        tasks = [
+            _translate_file_enhanced(f, job.source_lang, job.target_lang)
+            for f in job.files
+        ]
+    else:
+        if job.enhance_accuracy and not llm_available():
+            logger.warning(
+                "Job %s requested enhanced accuracy but no LLM is configured. "
+                "Falling back to standard translation.", job.id,
+            )
+        tasks = [
+            _translate_file(f, job.source_lang, job.target_lang)
+            for f in job.files
+        ]
     await asyncio.gather(*tasks, return_exceptions=True)
 
     # Determine overall status

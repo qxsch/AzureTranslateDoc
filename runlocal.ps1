@@ -88,19 +88,56 @@ if (-not (Test-Path $envFilePath)) {
         Write-Host "  WARNING: No storage account found – batch translation (PDF, DOCX) will not work." -ForegroundColor Yellow
     }
 
+    # Find Azure OpenAI resource for glossary-enhanced translation
+    $openaiResource = Get-AzCognitiveServicesAccount -ResourceGroupName $ResourceGroup |
+                      Where-Object { $_.AccountType -eq "OpenAI" } |
+                      Select-Object -First 1
+
+    $openaiEndpoint = ""
+    $openaiDeployment = "gpt-4o"
+    $openaiApiKey = ""
+    if ($openaiResource) {
+        $openaiEndpoint = "https://$($openaiResource.AccountName).openai.azure.com"
+        $openaiKey = (Get-AzCognitiveServicesAccountKey -ResourceGroupName $ResourceGroup -Name $openaiResource.AccountName).Key1
+        $openaiApiKey = ""  # We use key-based auth via AZURE_OPENAI_ENDPOINT + key header
+        Write-Host "  Azure OpenAI: $openaiEndpoint (deployment=$openaiDeployment)" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  NOTE: For local Docker, Azure OpenAI uses key-based auth." -ForegroundColor Yellow
+        Write-Host "  Alternatively, set OPENAI_API_KEY in .env for direct OpenAI API access." -ForegroundColor Yellow
+    } else {
+        Write-Host "  No Azure OpenAI resource found in '$ResourceGroup'." -ForegroundColor Yellow
+        Write-Host "  Enhanced translation will be unavailable unless you set OPENAI_API_KEY in .env." -ForegroundColor Yellow
+    }
+
     # Ensure the directory exists
     $envDir = Split-Path $envFilePath -Parent
     if (-not (Test-Path $envDir)) { New-Item -ItemType Directory -Path $envDir -Force | Out-Null }
 
-    @(
+    $envLines = @(
         "AZURE_TRANSLATOR_ENDPOINT=$translatorEp"
         "AZURE_TRANSLATOR_KEY=$translatorKey"
         "AZURE_TRANSLATOR_REGION=$location"
         "AZURE_STORAGE_ACCOUNT_NAME=$storageAccountName"
         "AZURE_STORAGE_CONNECTION_STRING=$storageConnStr"
-    ) | Set-Content -Path $envFilePath -Encoding utf8
+    )
+    if ($openaiResource) {
+        $envLines += "AZURE_OPENAI_ENDPOINT=$openaiEndpoint"
+        $envLines += "AZURE_OPENAI_DEPLOYMENT=$openaiDeployment"
+        # For local Docker, we pass the key directly since managed identity is not available
+        $envLines += "# Azure OpenAI key for local auth (managed identity not available in Docker)"
+        $envLines += "# To use OpenAI API instead, comment the above and set:"
+        $envLines += "# OPENAI_API_KEY=sk-..."
+    } else {
+        $envLines += "# No Azure OpenAI found. For enhanced translation, set one of:"
+        $envLines += "# AZURE_OPENAI_ENDPOINT=https://<name>.openai.azure.com"
+        $envLines += "# AZURE_OPENAI_DEPLOYMENT=gpt-4o"
+        $envLines += "# --- OR ---"
+        $envLines += "# OPENAI_API_KEY=sk-..."
+    }
 
-    Write-Host "  $EnvFile created with Translator + Storage credentials." -ForegroundColor Green
+    $envLines | Set-Content -Path $envFilePath -Encoding utf8
+
+    Write-Host "  $EnvFile created with Translator + Storage + OpenAI credentials." -ForegroundColor Green
 } else {
     Write-Host "[0/2] $EnvFile already exists – using existing file." -ForegroundColor Gray
 }

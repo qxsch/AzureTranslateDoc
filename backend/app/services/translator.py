@@ -310,6 +310,7 @@ async def _translate_sync(
     source_lang: str,
     target_lang: str,
     content_type: str,
+    glossary_bytes: bytes | None = None,
 ) -> bytes:
     """Translate a text-based document via the synchronous API."""
 
@@ -329,12 +330,17 @@ async def _translate_sync(
     safe_filename = f"{safe_stem}.{ext}" if ext else safe_stem
 
     logger.info(
-        "Sync translation: POST %s  (file=%s [%s], %d bytes, %s, %s → %s)",
+        "Sync translation: POST %s  (file=%s [%s], %d bytes, %s, %s → %s, glossary=%s)",
         url, filename, safe_filename, len(file_bytes),
         content_type, source_lang, target_lang,
+        f"{len(glossary_bytes)} bytes" if glossary_bytes else "none",
     )
 
     multipart_files = {"document": (safe_filename, file_bytes, content_type)}
+    if glossary_bytes:
+        multipart_files["glossary"] = (
+            "glossary.tsv", glossary_bytes, "text/tab-separated-values",
+        )
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         response = await client.post(
@@ -380,12 +386,14 @@ async def _translate_batch(
     source_lang: str,
     target_lang: str,
     content_type: str,
+    glossary_bytes: bytes | None = None,
 ) -> bytes:
     """Translate a binary document via the batch API and Blob Storage."""
 
     job_id = uuid.uuid4().hex[:12]
     source_blob = f"{job_id}/{filename}"
     target_blob = f"{job_id}/{filename}"
+    glossary_blob = f"{job_id}/glossary.tsv" if glossary_bytes else None
 
     logger.info(
         "Batch translation: %s (%d bytes, %s, %s → %s, job=%s)",
@@ -405,23 +413,45 @@ async def _translate_batch(
             )
             logger.debug("Uploaded source blob: %s/%s", _SOURCE_CONTAINER, source_blob)
 
-            # 2. Build blob URLs (Translator accesses via its system identity)
+            # 2. Upload glossary blob if provided
+            if glossary_bytes and glossary_blob:
+                await src_container.upload_blob(
+                    glossary_blob,
+                    glossary_bytes,
+                    content_settings=ContentSettings(
+                        content_type="text/tab-separated-values"
+                    ),
+                    overwrite=True,
+                )
+                logger.debug(
+                    "Uploaded glossary blob: %s/%s (%d bytes)",
+                    _SOURCE_CONTAINER, glossary_blob, len(glossary_bytes),
+                )
+
+            # 3. Build blob URLs (Translator accesses via its system identity)
             source_url = _build_blob_url(_SOURCE_CONTAINER, source_blob)
             target_url = _build_blob_url(_TARGET_CONTAINER, target_blob)
 
-            # 3. Start batch translation
+            # 4. Start batch translation
             batch_url = _get_batch_url()
             headers = _get_headers()
             headers["Content-Type"] = "application/json"
+
+            target_entry: dict[str, Any] = {
+                "targetUrl": target_url, "language": target_lang,
+            }
+            if glossary_bytes and glossary_blob:
+                glossary_url = _build_blob_url(_SOURCE_CONTAINER, glossary_blob)
+                target_entry["glossaries"] = [
+                    {"glossaryUrl": glossary_url, "format": "TSV"}
+                ]
 
             body: dict[str, Any] = {
                 "inputs": [
                     {
                         "storageType": "File",
                         "source": {"sourceUrl": source_url},
-                        "targets": [
-                            {"targetUrl": target_url, "language": target_lang}
-                        ],
+                        "targets": [target_entry],
                     }
                 ]
             }
@@ -450,10 +480,10 @@ async def _translate_batch(
 
             logger.info("Batch started: %s", operation_url)
 
-            # 4. Poll until translation finishes
+            # 5. Poll until translation finishes
             await _poll_batch(operation_url)
 
-            # 5. Download translated file from target container
+            # 6. Download translated file from target container
             tgt_container = blob_client.get_container_client(_TARGET_CONTAINER)
             download = await tgt_container.download_blob(target_blob)
             translated = await download.readall()
@@ -465,11 +495,14 @@ async def _translate_batch(
             return translated
 
         finally:
-            # 6. Clean up blobs (best-effort; lifecycle policy is safety net)
-            for ctr, blob in [
+            # 7. Clean up blobs (best-effort; lifecycle policy is safety net)
+            blobs_to_clean = [
                 (_SOURCE_CONTAINER, source_blob),
-                (_TARGET_CONTAINER, target_blob)
-            ]:
+                (_TARGET_CONTAINER, target_blob),
+            ]
+            if glossary_blob:
+                blobs_to_clean.append((_SOURCE_CONTAINER, glossary_blob))
+            for ctr, blob in blobs_to_clean:
                 try:
                     await blob_client.get_container_client(ctr).delete_blob(blob)
                     logger.debug("Deleted blob %s/%s", ctr, blob)
@@ -537,12 +570,16 @@ async def translate_document(
     file_extension: str,
     source_lang: str,
     target_lang: str,
+    glossary_bytes: bytes | None = None,
 ) -> bytes:
     """
     Translate a document, routing to the appropriate API:
 
     * **text/** formats  → fast synchronous single-document API
     * everything else (PDF, DOCX, …) → batch API via Blob Storage
+
+    If *glossary_bytes* is provided (UTF-8 TSV), it will be attached to
+    the translation request to enforce consistent terminology.
     """
     _check_endpoint()
     if _GLOBAL_ENDPOINT in settings.azure_translator_endpoint:
@@ -560,9 +597,11 @@ async def translate_document(
         return await _translate_sync(
             file_bytes, filename, file_extension,
             source_lang, target_lang, content_type,
+            glossary_bytes=glossary_bytes,
         )
 
     return await _translate_batch(
         file_bytes, filename, file_extension,
         source_lang, target_lang, content_type,
+        glossary_bytes=glossary_bytes,
     )

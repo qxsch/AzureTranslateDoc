@@ -30,6 +30,7 @@ param customDomains array = []
 var uniqueSuffix = uniqueString(resourceGroup().id)
 var acrName = '${replace(appName, '-', '')}${uniqueSuffix}'
 var translatorName = '${appName}-${uniqueSuffix}'
+var openaiName = '${appName}-openai-${uniqueSuffix}'
 var storageAccountName = 'sttranslate${uniqueSuffix}'
 var envName = '${appName}-env'
 var appInsightsName = '${appName}-insights'
@@ -101,6 +102,53 @@ resource translatorRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       cognitiveServicesUserRoleId
+    )
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Azure OpenAI (for glossary-enhanced translation)
+// ---------------------------------------------------------------------------
+
+resource openai 'Microsoft.CognitiveServices/accounts@2025-10-01-preview' = {
+  name: openaiName
+  location: location
+  kind: 'OpenAI'
+  sku: { name: 'S0' }
+  properties: {
+    customSubDomainName: openaiName
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
+resource openaiDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-10-01-preview' = {
+  parent: openai
+  name: 'gpt-4o'
+  sku: {
+    name: 'GlobalStandard'
+    capacity: 30
+  }
+  properties: {
+    model: {
+      format: 'OpenAI'
+      name: 'gpt-4o'
+      version: '2024-11-20'
+    }
+  }
+}
+
+// Cognitive Services OpenAI User role → Managed Identity
+var cognitiveServicesOpenAIUserRoleId = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
+
+resource openaiRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(openai.id, managedIdentity.id, cognitiveServicesOpenAIUserRoleId)
+  scope: openai
+  properties: {
+    principalId: managedIdentity.properties.principalId
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      cognitiveServicesOpenAIUserRoleId
     )
     principalType: 'ServicePrincipal'
   }
@@ -292,6 +340,8 @@ resource containerApp 'Microsoft.App/containerApps@2025-07-01' = {
             { name: 'USE_MANAGED_IDENTITY', value: 'true' }
             { name: 'AZURE_CLIENT_ID', value: managedIdentity.properties.clientId }
             { name: 'AZURE_STORAGE_ACCOUNT_NAME', value: storageAccount.name }
+            { name: 'AZURE_OPENAI_ENDPOINT', value: 'https://${openaiName}.openai.azure.com' }
+            { name: 'AZURE_OPENAI_DEPLOYMENT', value: 'gpt-4o' }
           ]
         }
       ]
@@ -345,5 +395,7 @@ output containerAppFqdn string = containerApp.properties.configuration.ingress.f
 output containerAppEnvName string = containerAppEnv.name
 output translatorName string = translator.name
 output translatorEndpoint string = 'https://${translatorName}.cognitiveservices.azure.com'
+output openaiName string = openai.name
+output openaiEndpoint string = 'https://${openaiName}.openai.azure.com'
 output managedIdentityClientId string = managedIdentity.properties.clientId
 output storageAccountName string = storageAccount.name
