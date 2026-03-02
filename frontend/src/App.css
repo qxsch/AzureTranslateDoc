@@ -26,6 +26,7 @@
 .header__icon {
   display: inline-block;
   animation: spin 8s linear infinite;
+  -webkit-text-fill-color: initial;
 }
 .header__sub {
   color: #64748b;

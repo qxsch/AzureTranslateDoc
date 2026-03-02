@@ -19,15 +19,48 @@
 .PARAMETER localDockerBuild
   Use local Docker build and push instead of ACR cloud build.
   Requires Docker Desktop running locally.
+
+.PARAMETER CustomDomain
+  Optional custom domain name (e.g. translate.example.com).
+  When set, the script validates DNS records (CNAME + TXT) and binds
+  the domain with a managed TLS certificate.  Run without this
+  parameter first, set up DNS, then re-run with -CustomDomain.
 #>
 param(
     [string]$ResourceGroup  = "rg-translatedoc",
     [string]$Location       = "switzerlandnorth",
     [string]$AppName        = "translatedoc",
-    [switch]$localDockerBuild
+    [switch]$localDockerBuild,
+    [string]$CustomDomain   = "",
+    [switch]$CleanOldSecrets
 )
 
 $ErrorActionPreference = "Stop"
+
+# Helper: PATCH a Container App with retry on ContainerAppOperationInProgress
+function Invoke-ContainerAppPatch {
+    param(
+        [string]$Path,
+        [string]$Payload,
+        [string]$OperationLabel,
+        [int]$MaxRetries = 12,
+        [int]$RetryDelaySec = 15
+    )
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        $resp = Invoke-AzRestMethod -Method PATCH -Path $Path -Payload $Payload
+        if ($resp.StatusCode -in @(200, 201, 202)) {
+            return $resp
+        }
+        $errBody = $resp.Content | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($errBody.error.code -eq 'ContainerAppOperationInProgress' -and $attempt -lt $MaxRetries) {
+            Write-Host "  Operation in progress, retrying in ${RetryDelaySec}s... (attempt $attempt/$MaxRetries)" -ForegroundColor Gray
+            Start-Sleep -Seconds $RetryDelaySec
+        } else {
+            throw "Failed to ${OperationLabel}: $($resp.Content)"
+        }
+    }
+    throw "Failed to ${OperationLabel} after $MaxRetries attempts."
+}
 
 Write-Host ""
 Write-Host "=====================================" -ForegroundColor Cyan
@@ -107,12 +140,39 @@ if ($existingApp) {
 $endDate = (Get-Date).AddYears(2)
 $credential = New-AzADAppCredential -ObjectId $objectId -EndDate $endDate
 $clientSecret = $credential.SecretText
-Write-Host "  Client secret created." -ForegroundColor Gray
+Write-Host "  Client secret created. KeyId: $($credential.KeyId)  Expires: $($credential.EndDateTime)" -ForegroundColor Gray
 
 # -------------------------------------------------------------------
 # 3. Deploy Bicep infrastructure
 # -------------------------------------------------------------------
 Write-Host "[3/7] Deploying infrastructure (Bicep)..." -ForegroundColor Yellow
+
+# Pre-read existing custom domains from the Container App (if it exists)
+# so Bicep can preserve them during redeployment.
+$subscriptionId = $context.Subscription.Id
+$existingCustomDomains = @()
+$preAppRestPath = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.App/containerApps/${AppName}?api-version=2024-03-01"
+$preAppResp = Invoke-AzRestMethod -Method GET -Path $preAppRestPath
+if ($preAppResp.StatusCode -eq 200) {
+    $preAppInfo = $preAppResp.Content | ConvertFrom-Json
+    if ($preAppInfo.properties.configuration.ingress.customDomains) {
+        $existingCustomDomains = @($preAppInfo.properties.configuration.ingress.customDomains)
+    }
+    if ($existingCustomDomains.Count -gt 0) {
+        Write-Host "  Preserving existing custom domains through Bicep deployment:" -ForegroundColor Gray
+        foreach ($d in $existingCustomDomains) {
+            Write-Host "    - $($d.name)" -ForegroundColor Gray
+        }
+    }
+}
+
+# Convert custom domains to the format Bicep expects
+$bicepCustomDomains = @()
+foreach ($d in $existingCustomDomains) {
+    $entry = @{ name = $d.name; bindingType = $d.bindingType }
+    if ($d.certificateId) { $entry.certificateId = $d.certificateId }
+    $bicepCustomDomains += $entry
+}
 
 $deployment = New-AzResourceGroupDeployment `
     -ResourceGroupName $ResourceGroup `
@@ -120,6 +180,7 @@ $deployment = New-AzResourceGroupDeployment `
     -appName $AppName `
     -entraClientId (ConvertTo-SecureString $clientId -AsPlainText -Force) `
     -entraClientSecret (ConvertTo-SecureString $clientSecret -AsPlainText -Force) `
+    -customDomains $bicepCustomDomains `
     -Force
 
 # Fetch outputs
@@ -127,6 +188,7 @@ $acrName        = $deployment.Outputs["acrName"].Value
 $acrLogin       = $deployment.Outputs["acrLoginServer"].Value
 $caName         = $deployment.Outputs["containerAppName"].Value
 $fqdn           = $deployment.Outputs["containerAppFqdn"].Value
+$envName        = $deployment.Outputs["containerAppEnvName"].Value
 $translatorEp   = $deployment.Outputs["translatorEndpoint"].Value
 $storageName    = $deployment.Outputs["storageAccountName"].Value
 
@@ -136,13 +198,131 @@ Write-Host "  Translator:  $translatorEp"   -ForegroundColor Gray
 Write-Host "  Storage:     $storageName"     -ForegroundColor Gray
 
 # -------------------------------------------------------------------
-# 4. Update redirect URI on app registration
+# 3b. Discover existing custom domains & early DNS validation
 # -------------------------------------------------------------------
-Write-Host "[4/7] Updating Entra ID redirect URI..." -ForegroundColor Yellow
 
-$redirectUri = "https://${fqdn}/.auth/login/aad/callback"
+# Read the Container App Environment for the domain verification ID
+$caEnvPath = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.App/managedEnvironments/${envName}?api-version=2024-03-01"
+$caEnvResponse = Invoke-AzRestMethod -Method GET -Path $caEnvPath
+if ($caEnvResponse.StatusCode -ne 200) {
+    throw "Failed to read Container App Environment: $($caEnvResponse.Content)"
+}
+$caEnvInfo = $caEnvResponse.Content | ConvertFrom-Json
+$verificationId = $caEnvInfo.properties.customDomainConfiguration.customDomainVerificationId
+
+# Read existing custom domains already bound to the Container App (refresh after Bicep)
+$appRestPath = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.App/containerApps/${caName}?api-version=2024-03-01"
+$appGetResp = Invoke-AzRestMethod -Method GET -Path $appRestPath
+$appInfo = $appGetResp.Content | ConvertFrom-Json
+$existingCustomDomains = @()
+if ($appInfo.properties.configuration.ingress.customDomains) {
+    $existingCustomDomains = @($appInfo.properties.configuration.ingress.customDomains)
+}
+$existingDomainNames = @($existingCustomDomains | ForEach-Object { $_.name })
+
+if ($existingDomainNames.Count -gt 0) {
+    Write-Host "  Active custom domains:" -ForegroundColor Gray
+    foreach ($dn in $existingDomainNames) {
+        Write-Host "    - $dn" -ForegroundColor Gray
+    }
+}
+
+# Early DNS validation when -CustomDomain is specified — fail fast before build
+if ($CustomDomain) {
+    $existingEntry = $existingCustomDomains | Where-Object { $_.name -eq $CustomDomain } | Select-Object -First 1
+    if ($existingEntry -and $existingEntry.bindingType -eq 'SniEnabled' -and $existingEntry.certificateId) {
+        Write-Host "  Custom domain '$CustomDomain' is already bound with TLS — nothing new to add." -ForegroundColor Green
+        $CustomDomain = ""   # clear to skip binding later; domain stays in existingDomainNames
+    } elseif ($existingEntry) {
+        Write-Host "  Custom domain '$CustomDomain' exists but binding is '$($existingEntry.bindingType)' — will repair in step 7." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "[DNS Check] Validating DNS for '$CustomDomain' before proceeding..." -ForegroundColor Yellow
+        $dnsOk = $true
+
+        # --- CNAME ---
+        try {
+            $cnameRecords = Resolve-DnsName -Name $CustomDomain -Type CNAME -DnsOnly -ErrorAction Stop
+            $cnameTarget = ($cnameRecords | Where-Object { $_.QueryType -eq 'CNAME' } |
+                            Select-Object -First 1).NameHost
+            if ($cnameTarget) { $cnameTarget = $cnameTarget.TrimEnd('.') }
+            $expectedFqdn = $fqdn.TrimEnd('.')
+            if ($cnameTarget -ne $expectedFqdn) {
+                Write-Host "  [FAIL] CNAME points to '$cnameTarget', expected '$expectedFqdn'" -ForegroundColor Red
+                $dnsOk = $false
+            } else {
+                Write-Host "  [OK]   CNAME  $CustomDomain -> $fqdn" -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "  [FAIL] CNAME record not found for '$CustomDomain'" -ForegroundColor Red
+            $dnsOk = $false
+        }
+
+        # --- TXT (asuid.<domain>) ---
+        $txtHost = "asuid.$CustomDomain"
+        try {
+            $txtRecords = Resolve-DnsName -Name $txtHost -Type TXT -DnsOnly -ErrorAction Stop
+            $txtValues  = ($txtRecords | Where-Object { $_.QueryType -eq 'TXT' }).Strings
+            if ($txtValues -contains $verificationId) {
+                Write-Host "  [OK]   TXT    $txtHost = $verificationId" -ForegroundColor Green
+            } else {
+                Write-Host "  [FAIL] TXT value mismatch. Got '$($txtValues -join ', ')', expected '$verificationId'" -ForegroundColor Red
+                $dnsOk = $false
+            }
+        } catch {
+            Write-Host "  [FAIL] TXT record not found for '$txtHost'" -ForegroundColor Red
+            $dnsOk = $false
+        }
+
+        if (-not $dnsOk) {
+            Write-Host ""
+            Write-Host "  DNS is not correctly configured yet. Stopping before build." -ForegroundColor Red
+            Write-Host "  Please create these records with your external DNS provider:" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "    Type   Host                              Value" -ForegroundColor White
+            Write-Host "    -----  --------------------------------  ----------------------------------------" -ForegroundColor Gray
+            Write-Host "    CNAME  $CustomDomain" -ForegroundColor White -NoNewline
+            Write-Host ("  " + $fqdn) -ForegroundColor Cyan
+            Write-Host "    TXT    asuid.$CustomDomain" -ForegroundColor White -NoNewline
+            Write-Host ("  " + $verificationId) -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "  After DNS propagation, re-run:" -ForegroundColor Yellow
+            Write-Host "    .\deploy.ps1 -CustomDomain $CustomDomain" -ForegroundColor White
+            Write-Host ""
+            exit 1
+        }
+
+        Write-Host "  DNS validated. Will bind domain after image deployment." -ForegroundColor Green
+        Write-Host ""
+    }
+}
+
+# -------------------------------------------------------------------
+# 4. Update Entra ID redirect URIs (default + ALL custom domains)
+# -------------------------------------------------------------------
+Write-Host "[4/7] Updating Entra ID redirect URIs..." -ForegroundColor Yellow
+
+# Build comprehensive list: default FQDN + every active custom domain + new domain
+$allHostnames = @($fqdn)
+foreach ($dn in $existingDomainNames) {
+    if ($allHostnames -notcontains $dn) { $allHostnames += $dn }
+}
+if ($CustomDomain -and ($allHostnames -notcontains $CustomDomain)) {
+    $allHostnames += $CustomDomain
+}
+
+$redirectUris = @()
+foreach ($hostname in $allHostnames) {
+    $redirectUris += "https://${hostname}/.auth/login/aad/callback"
+}
+
+Write-Host "  Redirect URIs:" -ForegroundColor Gray
+foreach ($uri in $redirectUris) {
+    Write-Host "    $uri" -ForegroundColor Gray
+}
+
 Update-AzADApplication -ObjectId $objectId -Web @{
-    RedirectUri          = @($redirectUri)
+    RedirectUri          = $redirectUris
     ImplicitGrantSetting = @{ EnableIdTokenIssuance = $true }
 }
 
@@ -269,45 +449,213 @@ Write-Host "[6/7] Updating Container App with new image..." -ForegroundColor Yel
 
 $imageRef = "${acrLogin}/${AppName}:latest"
 
-# Read current container app to preserve env vars, resources, and scale config
-$ca = Get-AzContainerApp -ResourceGroupName $ResourceGroup -Name $caName
-$existing = $ca.TemplateContainer | Where-Object { $_.Name -eq $AppName } | Select-Object -First 1
+# Use REST API PATCH to update ONLY the container image.
+# Update-AzContainerApp does a full update that resets custom domain bindings.
+$appGetForImage = Invoke-AzRestMethod -Method GET -Path $appRestPath
+$appInfoForImage = $appGetForImage.Content | ConvertFrom-Json
 
-# Build container spec preserving existing configuration
-$containerSpec = @{
-    Name  = $AppName
-    Image = $imageRef
-}
-
-# Convert SDK env-var objects to plain hashtables so Update-AzContainerApp accepts them
-if ($existing.Env -and $existing.Env.Count -gt 0) {
-    $envList = @()
-    foreach ($e in $existing.Env) {
-        $entry = @{ Name = $e.Name }
-        if ($e.Value)     { $entry.Value     = $e.Value }
-        if ($e.SecretRef) { $entry.SecretRef = $e.SecretRef }
-        $envList += $entry
+# Update the image in the existing template (preserves env vars, resources, scale, etc.)
+foreach ($container in $appInfoForImage.properties.template.containers) {
+    if ($container.name -eq $AppName) {
+        $container.image = $imageRef
     }
-    $containerSpec.Env = $envList
 }
 
-if ($existing.ResourceCpu)    { $containerSpec.ResourceCpu    = $existing.ResourceCpu }
-if ($existing.ResourceMemory) { $containerSpec.ResourceMemory = $existing.ResourceMemory }
+$imagePatchPayload = @{
+    properties = @{
+        template = @{
+            containers = @($appInfoForImage.properties.template.containers)
+        }
+    }
+} | ConvertTo-Json -Depth 10
 
-Update-AzContainerApp `
-    -ResourceGroupName $ResourceGroup `
-    -Name $caName `
-    -TemplateContainer @($containerSpec) | Out-Null
+Invoke-ContainerAppPatch -Path $appRestPath -Payload $imagePatchPayload -OperationLabel "update container image" | Out-Null
+Write-Host "  Image updated to $imageRef" -ForegroundColor Green
 
 # -------------------------------------------------------------------
-# 7. Done!
+# 7. Bind new custom domain with managed TLS certificate
+# -------------------------------------------------------------------
+if ($CustomDomain) {
+    Write-Host "[7/7] Binding custom domain '$CustomDomain'..." -ForegroundColor Yellow
+
+    $certName = ($CustomDomain -replace '[^a-zA-Z0-9-]', '-') + "-cert"
+    $certPath = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.App/managedEnvironments/${envName}/managedCertificates/${certName}?api-version=2024-03-01"
+
+    # 7a. Add the custom domain to the Container App with binding DISABLED first.
+    #     Azure requires the hostname to exist on the app BEFORE a managed cert can be created.
+    Write-Host "  Adding domain to Container App (binding disabled)..." -ForegroundColor Gray
+
+    $appGetResp2 = Invoke-AzRestMethod -Method GET -Path $appRestPath
+    $appInfo2 = $appGetResp2.Content | ConvertFrom-Json
+    $currentDomains = $appInfo2.properties.configuration.ingress.customDomains
+
+    $domainsList = @()
+    if ($currentDomains) {
+        foreach ($d in $currentDomains) {
+            if ($d.name -eq $CustomDomain) { continue }   # replace if already present
+            $domainsList += @{
+                name          = $d.name
+                certificateId = $d.certificateId
+                bindingType   = $d.bindingType
+            }
+        }
+    }
+    # Add with Disabled binding — no cert yet
+    $domainsList += @{
+        name        = $CustomDomain
+        bindingType = "Disabled"
+    }
+
+    $patchPayload = @{
+        properties = @{
+            configuration = @{
+                ingress = @{
+                    customDomains = $domainsList
+                }
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    Invoke-ContainerAppPatch -Path $appRestPath -Payload $patchPayload -OperationLabel "add custom domain (disabled)" | Out-Null
+    Write-Host "  Domain added to Container App." -ForegroundColor Green
+
+    # 7b. Create / reuse managed certificate (now the hostname exists on the app)
+    $certCheck = Invoke-AzRestMethod -Method GET -Path $certPath
+    if ($certCheck.StatusCode -eq 200) {
+        $certInfo = $certCheck.Content | ConvertFrom-Json
+        $certResourceId = $certInfo.id
+        Write-Host "  Managed certificate already exists: $certName" -ForegroundColor Gray
+    } else {
+        Write-Host "  Creating managed certificate (this may take a few minutes)..." -ForegroundColor Gray
+        $certPayload = @{
+            location   = $Location
+            properties = @{
+                subjectName             = $CustomDomain
+                domainControlValidation = "CNAME"
+            }
+        } | ConvertTo-Json -Depth 5
+
+        $certCreateResp = Invoke-AzRestMethod -Method PUT -Path $certPath -Payload $certPayload
+        if ($certCreateResp.StatusCode -notin @(200, 201, 202)) {
+            throw "Failed to create managed certificate: $($certCreateResp.Content)"
+        }
+        $certInfo = $certCreateResp.Content | ConvertFrom-Json
+        $certResourceId = $certInfo.id
+
+        # Poll until provisioning succeeds (up to 5 minutes)
+        $maxWait  = 300
+        $elapsed  = 0
+        $interval = 15
+        do {
+            Start-Sleep -Seconds $interval
+            $elapsed += $interval
+            $pollResp = Invoke-AzRestMethod -Method GET -Path $certPath
+            $pollInfo = $pollResp.Content | ConvertFrom-Json
+            $provState = $pollInfo.properties.provisioningState
+            Write-Host "  Certificate status: $provState (${elapsed}s elapsed)..." -ForegroundColor Gray
+        } while ($provState -notin @("Succeeded", "Failed", "Canceled") -and $elapsed -lt $maxWait)
+
+        if ($provState -ne "Succeeded") {
+            throw "Managed certificate provisioning failed with status: $provState"
+        }
+        Write-Host "  Managed certificate ready." -ForegroundColor Green
+    }
+
+    # 7c. Update the domain binding from Disabled to SniEnabled with the certificate
+    Write-Host "  Enabling TLS binding..." -ForegroundColor Gray
+
+    $appGetResp3 = Invoke-AzRestMethod -Method GET -Path $appRestPath
+    $appInfo3 = $appGetResp3.Content | ConvertFrom-Json
+    $currentDomains3 = $appInfo3.properties.configuration.ingress.customDomains
+
+    $domainsList2 = @()
+    if ($currentDomains3) {
+        foreach ($d in $currentDomains3) {
+            if ($d.name -eq $CustomDomain) {
+                $domainsList2 += @{
+                    name          = $CustomDomain
+                    certificateId = $certResourceId
+                    bindingType   = "SniEnabled"
+                }
+            } else {
+                $domainsList2 += @{
+                    name          = $d.name
+                    certificateId = $d.certificateId
+                    bindingType   = $d.bindingType
+                }
+            }
+        }
+    }
+
+    $patchPayload2 = @{
+        properties = @{
+            configuration = @{
+                ingress = @{
+                    customDomains = $domainsList2
+                }
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    Invoke-ContainerAppPatch -Path $appRestPath -Payload $patchPayload2 -OperationLabel "enable TLS binding" | Out-Null
+    Write-Host "  Custom domain '$CustomDomain' bound with managed TLS certificate." -ForegroundColor Green
+}
+
+# -------------------------------------------------------------------
+# Done!
 # -------------------------------------------------------------------
 Write-Host ""
 Write-Host "=====================================" -ForegroundColor Green
 Write-Host "  Deployment complete!" -ForegroundColor Green
 Write-Host "=====================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  URL:  https://$fqdn" -ForegroundColor White
+Write-Host "  URLs:" -ForegroundColor White
+Write-Host "    https://$fqdn" -ForegroundColor White
+
+# Collect all active custom domains (existing + newly added)
+$activeCustomDomains = @($existingDomainNames)
+if ($CustomDomain -and ($activeCustomDomains -notcontains $CustomDomain)) {
+    $activeCustomDomains += $CustomDomain
+}
+foreach ($d in $activeCustomDomains) {
+    Write-Host "    https://$d  (custom)" -ForegroundColor White
+}
+
 Write-Host ""
-Write-Host "  All users in your Entra ID tenant can sign in." -ForegroundColor Gray
+Write-Host "  All users in your Entra ID tenant can sign in via any URL above." -ForegroundColor Gray
+
+if ($activeCustomDomains.Count -eq 0) {
+    Write-Host ""
+    Write-Host "  ── Custom Domain ──" -ForegroundColor Cyan
+    Write-Host "  To use a custom domain, create these DNS records:" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "    Type   Host                              Value" -ForegroundColor White
+    Write-Host "    -----  --------------------------------  ----------------------------------------" -ForegroundColor Gray
+    Write-Host "    CNAME  <your-domain>                     $fqdn" -ForegroundColor White
+    Write-Host "    TXT    asuid.<your-domain>               $verificationId" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Then re-run:" -ForegroundColor Gray
+    Write-Host "    .\deploy.ps1 -CustomDomain <your-domain>" -ForegroundColor White
+}
+# -------------------------------------------------------------------
+# Clean up old app registration secrets (optional)
+# -------------------------------------------------------------------
+if ($CleanOldSecrets) {
+    Write-Host ""
+    Write-Host "Cleaning old client secrets (keeping KeyId $($credential.KeyId))..." -ForegroundColor Yellow
+    $allCreds = Get-AzADAppCredential -ObjectId $objectId
+    $removed = 0
+    foreach ($c in $allCreds) {
+        if ($c.KeyId -ne $credential.KeyId) {
+            Remove-AzADAppCredential -ObjectId $objectId -KeyId $c.KeyId
+            Write-Host "  Removed KeyId: $($c.KeyId)  (expired: $($c.EndDateTime))" -ForegroundColor Gray
+            $removed++
+        }
+    }
+    if ($removed -eq 0) {
+        Write-Host "  No old secrets to remove." -ForegroundColor Gray
+    } else {
+        Write-Host "  Removed $removed old secret(s)." -ForegroundColor Green
+    }
+}
 Write-Host ""

@@ -20,6 +20,9 @@ param entraClientSecret string
 @description('Container image (set after first build)')
 param containerImage string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
 
+@description('Existing custom domains to preserve across deployments (JSON array of objects with name, certificateId, bindingType)')
+param customDomains array = []
+
 // ---------------------------------------------------------------------------
 // Variables
 // ---------------------------------------------------------------------------
@@ -259,6 +262,7 @@ resource containerApp 'Microsoft.App/containerApps@2025-07-01' = {
         targetPort: 8000
         transport: 'http'
         allowInsecure: false
+        customDomains: customDomains
       }
       registries: [
         {
@@ -338,6 +342,7 @@ output acrName string = acr.name
 output acrLoginServer string = acr.properties.loginServer
 output containerAppName string = containerApp.name
 output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
+output containerAppEnvName string = containerAppEnv.name
 output translatorName string = translator.name
 output translatorEndpoint string = 'https://${translatorName}.cognitiveservices.azure.com'
 output managedIdentityClientId string = managedIdentity.properties.clientId
