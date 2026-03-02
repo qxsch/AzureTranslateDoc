@@ -119,6 +119,7 @@ resource openai 'Microsoft.CognitiveServices/accounts@2025-10-01-preview' = {
   properties: {
     customSubDomainName: openaiName
     publicNetworkAccess: 'Enabled'
+    storedCompletionsDisabled: true
   }
 }
 
