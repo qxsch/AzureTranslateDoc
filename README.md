@@ -389,10 +389,11 @@ Authentication is **not enforced** when running locally. The backend serves requ
 
 ## Known Limitations
 
-- **PDF output:** Translated PDFs are regenerated as clean text documents. Complex layouts, images, and fonts from the original PDF are not preserved.
-- **Markdown:** Markdown files are translated paragraph-by-paragraph. Code blocks and syntax may occasionally be altered by the translation engine.
-- **Images:** Only inline text is translated. Embedded images, charts, and diagrams are not processed.
-- **File size:** Default limit is 10 MB per document.
+- **Images & charts:** Text embedded inside images, charts, or diagrams within documents is not translated — only the document's native text content is processed.
+- **Markdown code blocks:** The translation engine may occasionally alter content inside fenced code blocks or inline code spans.
+- **In-memory jobs:** Translation jobs are stored in memory and expire after 1 hour. An app restart loses all pending and completed jobs.
+- **Language list:** The UI exposes 7 languages + auto-detect. Azure Translator supports many more, but they are not currently surfaced.
+- **File size:** Default limit is 10 MB per document (configurable via `MAX_FILE_SIZE_MB`).
 
 ---
 
